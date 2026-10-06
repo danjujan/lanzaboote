@@ -33,6 +33,7 @@ pub struct InstallerBuilder {
     configuration_limit: usize,
     bootcounting_initial_tries: u32,
     pcrlock_directory: Option<PathBuf>,
+    protected_system: Option<PathBuf>,
     esp: PathBuf,
     boot: PathBuf,
     generation_links: Vec<PathBuf>,
@@ -48,6 +49,7 @@ impl InstallerBuilder {
         configuration_limit: usize,
         bootcounting_initial_tries: u32,
         pcrlock_directory: Option<PathBuf>,
+        protected_system: Option<PathBuf>,
         esp: PathBuf,
         boot: PathBuf,
         generation_links: Vec<PathBuf>,
@@ -60,6 +62,7 @@ impl InstallerBuilder {
             configuration_limit,
             bootcounting_initial_tries,
             pcrlock_directory,
+            protected_system,
             esp,
             boot,
             generation_links,
@@ -86,6 +89,7 @@ impl InstallerBuilder {
             configuration_limit: self.configuration_limit,
             bootcounting_initial_tries: self.bootcounting_initial_tries,
             pcrlock_paths,
+            protected_system: self.protected_system,
             esp_paths,
             generation_links: self.generation_links,
             arch: self.arch,
@@ -103,6 +107,7 @@ pub struct Installer<S: Signer> {
     configuration_limit: usize,
     bootcounting_initial_tries: u32,
     pcrlock_paths: Option<PcrlockPaths>,
+    protected_system: Option<PathBuf>,
     esp_paths: SystemdEspPaths,
     generation_links: Vec<PathBuf>,
     arch: Architecture,
@@ -116,10 +121,19 @@ impl<S: Signer> Installer<S> {
             .generation_links
             .iter()
             .map(GenerationLink::from_path)
-            .collect::<Result<Vec<GenerationLink>>>()?;
+            .collect::<Result<BTreeSet<GenerationLink>>>()?;
 
-        // Sort the links by version, so that the limit actually skips the oldest generations.
-        links.sort_by_key(|l| l.version);
+        let booted_link = self
+            .protected_system
+            .as_ref()
+            .and_then(|p| fs::canonicalize(p).ok())
+            .and_then(|protected_system| {
+                log::info!("Protecting system {}", protected_system.display());
+                links.iter().find(|link| {
+                    fs::canonicalize(&link.path).is_ok_and(|resolved| resolved == protected_system)
+                })
+            })
+            .cloned();
 
         // A configuration limit of 0 means there is no limit.
         if self.configuration_limit > 0 {
@@ -134,7 +148,15 @@ impl<S: Signer> Installer<S> {
                 .rev()
                 .collect()
         };
-        self.install_generations_from_links(&links)?;
+
+        if let Some(booted_link) = booted_link
+            && !links.contains(&booted_link)
+        {
+            links.pop_first();
+            links.insert(booted_link);
+        }
+
+        self.install_generations_from_links(links.iter())?;
 
         self.install_systemd_boot()?;
 
@@ -177,9 +199,11 @@ impl<S: Signer> Installer<S> {
     }
 
     /// Install all generations from the provided `GenerationLinks`.
-    fn install_generations_from_links(&mut self, links: &[GenerationLink]) -> Result<()> {
+    fn install_generations_from_links<'a>(
+        &mut self,
+        links: impl Iterator<Item = &'a GenerationLink>,
+    ) -> Result<()> {
         let generations = links
-            .iter()
             .filter_map(|link| {
                 let generation_result = Generation::from_link(link)
                     .with_context(|| format!("Failed to build generation from link: {link:?}"));
@@ -469,41 +493,50 @@ impl<S: Signer> Installer<S> {
         };
 
         if newer_systemd_boot_available || !systemd_boot_is_signed || !measurement_exists {
+            // The following assumes that the "current" measurement before an update
+            // always refers to the bootloader that was used for startup of the system
+            // that performs the bootloader update.
+            // This means that a reboot must happen between two consecutive bootloader
+            // updates, otherwise we cannot produce a policy that covers PCR4 with this
+            // approach.
             if let Some(pcrlock_paths) = &self.pcrlock_paths {
-                // We do not version the bootloader measurement file. There will only ever be one
-                // bootloader version installed on the ESP and there is no rollback mechanism for it.
-                // That's why we also do not extend the GC roots with the path.
-                //
-                // However, we call this file "next" so that while the new bootloader is installed,
-                // the measurements of the current and next remain available.
-                let bootloader_pcrlock = pcrlock_paths.bootloader_measurement("next");
-                lock_pe(&systemd_boot, &bootloader_pcrlock)
-                    .context("Failed to lock Lanzaboote image with systemd-pcrlock")?;
+                // Path to measurement that was used prior to this implementation during an update,
+                // so the file should not exist *after* an update. In case it is still present, we
+                // simply delete it, because it would otherwise be picked up by pcrlock.
+                let legacy_path = pcrlock_paths.bootloader_measurement("next");
+                if legacy_path.exists() {
+                    log::info!("Found leftover measurement file, removing.");
+                    fs::remove_file(&legacy_path).with_context(|| {
+                        format!(
+                            "Failed to remove leftover measurement file {}",
+                            legacy_path.display()
+                        )
+                    })?;
+                };
+
+                let previous = pcrlock_paths.bootloader_measurement("previous");
+                // Path to measurement of the new loader PE that will override the current one
+                let current = pcrlock_paths.bootloader_measurement("current");
+
+                if current.exists() {
+                    fs::rename(&current, &previous).with_context(|| {
+                        format!(
+                            "Failed to rename {} to {}",
+                            current.display(),
+                            previous.display()
+                        )
+                    })?;
+                }
+
+                // Measure the bootloader we are about to install as "current".
+                lock_pe(&systemd_boot, &current)
+                    .context("Failed to lock systemd-boot image with systemd-pcrlock")?;
             }
 
             for to in [&self.esp_paths.efi_fallback, &self.esp_paths.systemd_boot] {
                 log::info!("Installing {}", to.display());
                 install_signed(&self.signer, &systemd_boot, to)
                     .with_context(|| format!("Failed to install systemd-boot binary to: {to:?}"))?;
-            }
-
-            // After installing the bootloader, rename the pcrlock measurement from "next" to
-            // "current". So that we can install "next" on the next update again.
-            if let Some(pcrlock_paths) = &self.pcrlock_paths {
-                let next = pcrlock_paths.bootloader_measurement("next");
-                let current = pcrlock_paths.bootloader_measurement("current");
-                log::debug!(
-                    "Renaming {} to {} after installing the bootloader.",
-                    next.display(),
-                    current.display()
-                );
-                fs::rename(&next, &current).with_context(|| {
-                    format!(
-                        "Failed to rename {} to {}",
-                        next.display(),
-                        current.display()
-                    )
-                })?;
             }
         }
 

@@ -68,6 +68,9 @@ struct InstallCommand {
     #[arg(long)]
     pcrlock_directory: Option<PathBuf>,
 
+    #[arg(long)]
+    protected_system: Option<PathBuf>,
+
     /// EFI system partition mountpoint (e.g. efiSysMountPoint)
     esp: PathBuf,
 
@@ -119,6 +122,7 @@ fn install(args: InstallCommand) -> Result<()> {
         args.configuration_limit,
         args.bootcounting_initial_tries,
         args.pcrlock_directory,
+        args.protected_system,
         args.esp,
         args.boot,
         args.generations,

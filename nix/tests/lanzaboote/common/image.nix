@@ -138,6 +138,7 @@ in
   };
 
   image.repart = {
+    enable = true;
     name = config.system.name;
     mkfsOptions = {
       # Makes the build significantly faster by slimming down the images.
@@ -212,8 +213,5 @@ in
     useDefaultFilesystems = false;
 
     useEFIBoot = true;
-
-    useSecureBoot = true;
-    efi.OVMF = pkgs.OVMFFull.fd;
   };
 }
